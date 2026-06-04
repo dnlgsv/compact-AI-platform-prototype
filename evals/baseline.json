@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "name": "observed citation is accepted",
+      "status": "passed"
+    },
+    {
+      "name": "unobserved citation is rejected",
+      "status": "passed"
+    },
+    {
+      "name": "date math calculates full elapsed years",
+      "status": "passed"
+    },
+    {
+      "name": "invalid tool input is reported as a structured observation",
+      "status": "passed"
+    },
+    {
+      "name": "malformed provider structured output is rejected",
+      "status": "passed"
+    },
+    {
+      "name": "fetch failure is reported without retrying the same source",
+      "status": "passed"
+    }
+  ]
+}
