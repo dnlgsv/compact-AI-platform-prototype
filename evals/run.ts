@@ -17,6 +17,8 @@ type EvalCaseResult = {
   error?: string;
 };
 
+type EvalCaseStatus = "passed" | "failed" | "missing";
+
 type EvalReport = {
   status: "passed" | "failed";
   runStartedAt: string;
@@ -26,6 +28,22 @@ type EvalReport = {
   failed: number;
   total: number;
   cases: EvalCaseResult[];
+};
+
+type EvalComparisonReport = {
+  status: "passed" | "failed";
+  comparedAt: string;
+  beforePath: string;
+  afterPath: string;
+  regressions: number;
+  fixes: number;
+  unchanged: number;
+  cases: Array<{
+    name: string;
+    before: EvalCaseStatus;
+    after: EvalCaseStatus;
+    change: "unchanged" | "regression" | "fixed" | "added" | "removed";
+  }>;
 };
 
 type EvalBaseline = {
@@ -270,6 +288,22 @@ const evalCases: EvalCase[] = [
 ];
 
 const options = parseArgs(process.argv.slice(2));
+if (options.compare) {
+  const comparison = await compareEvalReports(options.compare.before, options.compare.after);
+  if (options.json) {
+    const json = JSON.stringify(comparison, null, 2);
+    if (options.output) {
+      await writeReport(options.output, json);
+    } else {
+      console.log(json);
+    }
+  } else {
+    printComparisonReport(comparison);
+  }
+  if (comparison.status === "failed") {
+    process.exitCode = 1;
+  }
+} else {
 const report = await runEvalCases(evalCases, {
   runStartedAt: new Date().toISOString(),
   modelVersion: process.env.EVAL_MODEL_VERSION ?? "local",
@@ -294,8 +328,13 @@ if (options.json) {
   printTextReport(report);
 }
 
+if (options.save) {
+  await writeReport(defaultEvalReportPath(report.runStartedAt), JSON.stringify(report, null, 2));
+}
+
 if (report.failed > 0) {
   process.exitCode = 1;
+}
 }
 
 function htmlResponse(body: string) {
@@ -329,11 +368,27 @@ function parseArgs(args: string[]) {
     throw new Error("--output requires --json.");
   }
 
+  const compareIndex = args.indexOf("--compare");
+  let compare: { before: string; after: string } | undefined;
+  if (compareIndex !== -1) {
+    const before = args[compareIndex + 1];
+    const after = args[compareIndex + 2];
+    if (!before || before.startsWith("--") || !after || after.startsWith("--")) {
+      throw new Error("Expected two report paths after --compare.");
+    }
+    compare = {
+      before,
+      after,
+    };
+  }
+
   return {
     json: args.includes("--json"),
     output,
     baseline: readOption(args, "--baseline") ?? "evals/baseline.json",
     updateBaseline: args.includes("--update-baseline"),
+    save: args.includes("--save"),
+    compare,
   };
 }
 
@@ -376,6 +431,12 @@ function validateEvalReport(report: EvalReport) {
   }
 }
 
+async function readEvalReport(path: string): Promise<EvalReport> {
+  const report = JSON.parse(await readFile(resolveInsideWorkspace(path), "utf8")) as EvalReport;
+  validateEvalReport(report);
+  return report;
+}
+
 function validateBaseline(value: unknown): EvalBaseline {
   const candidate = value as { cases?: unknown };
   if (!Array.isArray(candidate.cases)) {
@@ -416,6 +477,60 @@ async function compareBaseline(baselinePath: string, report: EvalReport) {
       `Eval baseline mismatch. Run with --update-baseline if this change is intentional.\nExpected:\n${expected}\nActual:\n${actual}`,
     );
   }
+}
+
+async function compareEvalReports(beforePath: string, afterPath: string): Promise<EvalComparisonReport> {
+  const before = await readEvalReport(beforePath);
+  const after = await readEvalReport(afterPath);
+  const beforeCases = new Map<string, EvalCaseStatus>(before.cases.map((result) => [result.name, result.status]));
+  const afterCases = new Map<string, EvalCaseStatus>(after.cases.map((result) => [result.name, result.status]));
+  const names = [...new Set([...beforeCases.keys(), ...afterCases.keys()])].sort();
+  const cases = names.map((name) => {
+    const beforeStatus = beforeCases.get(name) ?? "missing";
+    const afterStatus = afterCases.get(name) ?? "missing";
+    return {
+      name,
+      before: beforeStatus,
+      after: afterStatus,
+      change: classifyCaseChange(beforeStatus, afterStatus),
+    };
+  });
+  const regressions = cases.filter((result) => result.change === "regression" || result.change === "removed").length;
+  const fixes = cases.filter((result) => result.change === "fixed").length;
+  const unchanged = cases.filter((result) => result.change === "unchanged").length;
+
+  return {
+    status: regressions === 0 ? "passed" : "failed",
+    comparedAt: new Date().toISOString(),
+    beforePath,
+    afterPath,
+    regressions,
+    fixes,
+    unchanged,
+    cases,
+  };
+}
+
+function classifyCaseChange(
+  before: EvalCaseStatus,
+  after: EvalCaseStatus,
+): EvalComparisonReport["cases"][number]["change"] {
+  if (before === after) {
+    return "unchanged";
+  }
+  if (before === "passed" && after === "failed") {
+    return "regression";
+  }
+  if (before === "failed" && after === "passed") {
+    return "fixed";
+  }
+  if (before === "missing") {
+    return "added";
+  }
+  if (after === "missing") {
+    return "removed";
+  }
+  return "unchanged";
 }
 
 async function writeBaseline(baselinePath: string, report: EvalReport) {
@@ -498,6 +613,25 @@ function printTextReport(report: EvalReport) {
 
   console.log("");
   console.log(`evals: ${report.passed} passed, ${report.failed} failed, ${report.total} total`);
+}
+
+function printComparisonReport(report: EvalComparisonReport) {
+  console.log(`comparedAt: ${report.comparedAt}`);
+  console.log(`before: ${report.beforePath}`);
+  console.log(`after: ${report.afterPath}`);
+  console.log("");
+
+  for (const result of report.cases) {
+    console.log(`${result.change} - ${result.name} (${result.before} -> ${result.after})`);
+  }
+
+  console.log("");
+  console.log(`comparison: ${report.regressions} regressions, ${report.fixes} fixes, ${report.unchanged} unchanged`);
+}
+
+function defaultEvalReportPath(runStartedAt: string): string {
+  const stamp = runStartedAt.replace(/[:.]/g, "-");
+  return `eval-results/eval-${stamp}.json`;
 }
 
 function errorMessage(error: unknown): string {
