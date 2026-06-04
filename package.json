@@ -1,0 +1,16 @@
+{
+  "name": "ai-engine-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api": "node --experimental-strip-types src/api.ts",
+    "eval": "node --experimental-strip-types evals/run.ts",
+    "research": "node --experimental-strip-types src/cli.ts",
+    "smoke": "node --experimental-strip-types scripts/smoke-demo.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

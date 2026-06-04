@@ -1,0 +1,7 @@
+eval-results/
+runs/
+node_modules/
+.env
+best-practices.md
+plan.md
+progress_status.md
