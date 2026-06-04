@@ -53,11 +53,14 @@ function parseBraveResults(payload: unknown): SearchResult[] {
       if (typeof result.title !== "string" || typeof result.url !== "string") {
         return undefined;
       }
-      return {
+      const searchResult: SearchResult = {
         title: result.title,
         url: result.url,
-        snippet: typeof result.description === "string" ? result.description : undefined,
       };
+      if (typeof result.description === "string") {
+        searchResult.snippet = result.description;
+      }
+      return searchResult;
     })
     .filter((item): item is SearchResult => item !== undefined);
 }

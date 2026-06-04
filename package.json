@@ -8,9 +8,14 @@
     "eval": "node --experimental-strip-types evals/run.ts",
     "research": "node --experimental-strip-types src/cli.ts",
     "smoke": "node --experimental-strip-types scripts/smoke-demo.ts",
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
   }
 }

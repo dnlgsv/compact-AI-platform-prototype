@@ -1,7 +1,12 @@
 eval-results/
 runs/
 node_modules/
+dist/
+coverage/
+*.log
 .env
+.env.local
+.env.*.local
 best-practices.md
 plan.md
 progress_status.md
