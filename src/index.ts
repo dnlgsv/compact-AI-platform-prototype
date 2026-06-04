@@ -1,3 +1,5 @@
+import type { RuntimeMetric, TraceSink } from "./observability.ts";
+
 export type ToolSideEffect = "none" | "local_write" | "external_write" | "process";
 
 export type Citation = {
@@ -99,6 +101,31 @@ export type TraceSpan = {
   };
 };
 
+export type TokenUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  source: "estimated" | "reported";
+};
+
+export type RunCost = {
+  estimatedUsd: number;
+  source: "estimated" | "not_configured";
+};
+
+export type RunMetadata = {
+  startedAt: string;
+  endedAt: string;
+  totalLatencyMs: number;
+  modelLatencyMs: number;
+  toolLatencyMs: number;
+  modelName: string;
+  promptVersion: string;
+  workflowVersion: string;
+  tokens: TokenUsage;
+  cost: RunCost;
+};
+
 export type AgentRunResult = {
   runId: string;
   status: "completed" | "failed";
@@ -106,13 +133,30 @@ export type AgentRunResult = {
   citations: Citation[];
   observations: Observation[];
   trace: TraceSpan[];
+  metadata: RunMetadata;
   stopReason: string;
+};
+
+export type TokenPricing = {
+  promptUsdPer1MTokens: number;
+  completionUsdPer1MTokens: number;
 };
 
 export type AgentConfig = {
   model: ModelAdapter;
-  tools: ToolDefinition[];
+  tools: ToolDefinition<any, any>[];
   policy?: Partial<PermissionPolicy>;
+  traceSink?: TraceSink;
+  metadata?: {
+    modelName?: string;
+    promptVersion?: string;
+    workflowVersion?: string;
+    tokenPricing?: TokenPricing;
+  };
+};
+
+export type AgentRunOptions = {
+  runId?: string;
 };
 
 const DEFAULT_POLICY: PermissionPolicy = {
@@ -135,7 +179,7 @@ export function createAgent(config: AgentConfig) {
       config.policy?.allowedSideEffects ?? DEFAULT_POLICY.allowedSideEffects,
   };
 
-  const tools = new Map<string, ToolDefinition>();
+  const tools = new Map<string, ToolDefinition<any, any>>();
   for (const tool of config.tools) {
     if (tools.has(tool.name)) {
       throw new Error(`Duplicate tool: ${tool.name}`);
@@ -147,46 +191,64 @@ export function createAgent(config: AgentConfig) {
   }
 
   return {
-    async run(task: string): Promise<AgentRunResult> {
-      const runId = createRunId();
+    async run(task: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
+      const runId = options.runId ?? createRunId();
       const startedAt = Date.now();
+      const runStartedAt = new Date(startedAt).toISOString();
       const observations: Observation[] = [];
       const trace: TraceSpan[] = [];
+      const tokenUsage: TokenUsage = {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        source: "estimated",
+      };
 
       for (let step = 1; step <= policy.maxSteps; step += 1) {
         if (policy.maxRunMs && Date.now() - startedAt > policy.maxRunMs) {
-          return failed(runId, observations, trace, "run_timeout", step);
+          return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "run_timeout", step);
         }
 
         let rawAction: unknown;
+        const modelInput = {
+          task,
+          step,
+          observations,
+          tools: [...tools.values()].map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            sideEffect: tool.sideEffect ?? "none",
+          })),
+        };
         try {
-          rawAction = await recordSpan(trace, "model.complete", "model", step, async () =>
-            config.model.complete({
-              task,
-              step,
-              observations,
-              tools: [...tools.values()].map((tool) => ({
-                name: tool.name,
-                description: tool.description,
-                sideEffect: tool.sideEffect ?? "none",
-              })),
-            }),
+          rawAction = await recordSpan(
+            trace,
+            config.traceSink,
+            "model.complete",
+            "model",
+            step,
+            async () => config.model.complete(modelInput),
+            {
+              modelName: config.metadata?.modelName ?? "unknown",
+              promptVersion: config.metadata?.promptVersion ?? "unknown",
+            },
           );
+          addTokenEstimate(tokenUsage, modelInput, rawAction);
         } catch (error) {
-          trace.push(createRuntimeErrorSpan(step, "model.failure", "model_failed", errorMessage(error)));
-          return failed(runId, observations, trace, "model_failed", step);
+          await pushSpan(trace, config.traceSink, createRuntimeErrorSpan(step, "model.failure", "model_failed", errorMessage(error)));
+          return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "model_failed", step);
         }
 
         let action: ModelAction;
         try {
           action = validateModelAction(rawAction);
         } catch (error) {
-          trace.push(createRuntimeErrorSpan(step, "model.action.validation", "invalid_model_action", errorMessage(error)));
-          return failed(runId, observations, trace, "model_action_validation_failed", step);
+          await pushSpan(trace, config.traceSink, createRuntimeErrorSpan(step, "model.action.validation", "invalid_model_action", errorMessage(error)));
+          return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "model_action_validation_failed", step);
         }
 
         if (policy.maxRunMs && Date.now() - startedAt > policy.maxRunMs) {
-          return failed(runId, observations, trace, "run_timeout", step);
+          return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "run_timeout", step);
         }
 
         if (action.type === "final") {
@@ -196,20 +258,23 @@ export function createAgent(config: AgentConfig) {
             : undefined;
 
           if (unobservedCitation) {
-            trace.push(createRuntimeErrorSpan(step, "citation.validation", "unobserved_citation", `Citation URL was not observed: ${unobservedCitation.url}`));
-            return failed(runId, observations, trace, "citation_validation_failed", step);
+            await pushSpan(trace, config.traceSink, createRuntimeErrorSpan(step, "citation.validation", "unobserved_citation", `Citation URL was not observed: ${unobservedCitation.url}`));
+            return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "citation_validation_failed", step);
           }
 
-          trace.push(createRuntimeStopSpan(step, "final_answer", "ok"));
-          return {
+          await pushSpan(trace, config.traceSink, createRuntimeStopSpan(step, "final_answer", "ok"));
+          const result = {
             runId,
             status: "completed",
             answer: action.answer,
             citations,
             observations,
             trace,
+            metadata: createRunMetadata(trace, tokenUsage, runStartedAt, startedAt, config),
             stopReason: "final_answer",
-          };
+          } satisfies AgentRunResult;
+          await recordRunMetrics(config.traceSink, result);
+          return result;
         }
 
         const observation = await runToolAction({
@@ -219,11 +284,12 @@ export function createAgent(config: AgentConfig) {
           tools,
           policy,
           trace,
+          traceSink: config.traceSink,
         });
         observations.push(observation);
       }
 
-      return failed(runId, observations, trace, "step_limit", policy.maxSteps);
+      return failed(runId, observations, trace, tokenUsage, runStartedAt, startedAt, config, "step_limit", policy.maxSteps);
     },
   };
 }
@@ -235,6 +301,7 @@ async function runToolAction(args: {
   tools: Map<string, ToolDefinition>;
   policy: PermissionPolicy;
   trace: TraceSpan[];
+  traceSink?: TraceSink;
 }): Promise<Observation> {
   const tool = args.tools.get(args.action.toolName);
   if (!tool) {
@@ -262,6 +329,7 @@ async function runToolAction(args: {
   try {
     const data = await recordSpan(
       args.trace,
+      args.traceSink,
       `tool.${tool.name}`,
       "tool",
       args.step,
@@ -320,6 +388,7 @@ async function executeWithTimeout(
 
 async function recordSpan<T>(
   trace: TraceSpan[],
+  traceSink: TraceSink | undefined,
   name: string,
   kind: TraceSpan["kind"],
   step: number,
@@ -332,7 +401,7 @@ async function recordSpan<T>(
   try {
     const result = await fn();
     const ended = Date.now();
-    trace.push({
+    const span = {
       id: `span_${trace.length + 1}`,
       name,
       kind,
@@ -342,11 +411,12 @@ async function recordSpan<T>(
       durationMs: ended - started,
       status: "ok",
       attributes,
-    });
+    } satisfies TraceSpan;
+    await pushSpan(trace, traceSink, span);
     return result;
   } catch (error) {
     const ended = Date.now();
-    trace.push({
+    const span = {
       id: `span_${trace.length + 1}`,
       name,
       kind,
@@ -360,27 +430,156 @@ async function recordSpan<T>(
         code: "span_failed",
         message: errorMessage(error),
       },
-    });
+    } satisfies TraceSpan;
+    await pushSpan(trace, traceSink, span);
     throw error;
   }
 }
 
-function failed(
+async function failed(
   runId: string,
   observations: Observation[],
   trace: TraceSpan[],
+  tokenUsage: TokenUsage,
+  runStartedAt: string,
+  startedAt: number,
+  config: AgentConfig,
   stopReason: string,
   step: number,
-): AgentRunResult {
-  trace.push(createRuntimeStopSpan(step, stopReason, "error"));
-  return {
+): Promise<AgentRunResult> {
+  await pushSpan(trace, config.traceSink, createRuntimeStopSpan(step, stopReason, "error"));
+  const result = {
     runId,
     status: "failed",
     citations: [],
     observations,
     trace,
+    metadata: createRunMetadata(trace, tokenUsage, runStartedAt, startedAt, config),
     stopReason,
+  } satisfies AgentRunResult;
+  await recordRunMetrics(config.traceSink, result);
+  return result;
+}
+
+async function pushSpan(trace: TraceSpan[], traceSink: TraceSink | undefined, span: TraceSpan): Promise<void> {
+  trace.push(span);
+  if (!traceSink) {
+    return;
+  }
+
+  try {
+    await traceSink.recordSpan(span);
+  } catch {
+    // Observability failures should not change agent behavior.
+  }
+}
+
+async function recordRunMetrics(traceSink: TraceSink | undefined, result: AgentRunResult): Promise<void> {
+  if (!traceSink) {
+    return;
+  }
+
+  const metrics: RuntimeMetric[] = [
+    metric("runtime.run.latency_ms", result.metadata.totalLatencyMs, "ms", result),
+    metric("runtime.model.latency_ms", result.metadata.modelLatencyMs, "ms", result),
+    metric("runtime.tool.latency_ms", result.metadata.toolLatencyMs, "ms", result),
+    metric("runtime.tokens.total", result.metadata.tokens.totalTokens, "tokens", result),
+    metric("runtime.cost.estimated_usd", result.metadata.cost.estimatedUsd, "usd", result),
+  ];
+
+  for (const item of metrics) {
+    try {
+      await traceSink.recordMetric(item);
+    } catch {
+      // Observability failures should not change agent behavior.
+    }
+  }
+}
+
+function metric(
+  name: string,
+  value: number,
+  unit: RuntimeMetric["unit"],
+  result: AgentRunResult,
+): RuntimeMetric {
+  return {
+    name,
+    value,
+    unit,
+    recordedAt: result.metadata.endedAt,
+    attributes: {
+      runId: result.runId,
+      status: result.status,
+      stopReason: result.stopReason,
+      modelName: result.metadata.modelName,
+      promptVersion: result.metadata.promptVersion,
+      workflowVersion: result.metadata.workflowVersion,
+    },
   };
+}
+
+function addTokenEstimate(tokenUsage: TokenUsage, modelInput: ModelInput, rawAction: unknown): void {
+  tokenUsage.promptTokens += estimateTokens(modelInput);
+  tokenUsage.completionTokens += estimateTokens(rawAction);
+  tokenUsage.totalTokens = tokenUsage.promptTokens + tokenUsage.completionTokens;
+}
+
+function createRunMetadata(
+  trace: TraceSpan[],
+  tokenUsage: TokenUsage,
+  runStartedAt: string,
+  startedAt: number,
+  config: AgentConfig,
+): RunMetadata {
+  const endedAt = new Date().toISOString();
+  const modelLatencyMs = sumSpanDuration(trace, "model");
+  const toolLatencyMs = sumSpanDuration(trace, "tool");
+  return {
+    startedAt: runStartedAt,
+    endedAt,
+    totalLatencyMs: Date.now() - startedAt,
+    modelLatencyMs,
+    toolLatencyMs,
+    modelName: config.metadata?.modelName ?? "unknown",
+    promptVersion: config.metadata?.promptVersion ?? "unknown",
+    workflowVersion: config.metadata?.workflowVersion ?? "unknown",
+    tokens: {
+      ...tokenUsage,
+    },
+    cost: estimateCost(tokenUsage, config.metadata?.tokenPricing),
+  };
+}
+
+function sumSpanDuration(trace: TraceSpan[], kind: TraceSpan["kind"]): number {
+  return trace
+    .filter((span) => span.kind === kind)
+    .reduce((total, span) => total + span.durationMs, 0);
+}
+
+function estimateTokens(value: unknown): number {
+  const raw = JSON.stringify(value) ?? String(value);
+  return Math.max(1, Math.ceil(raw.length / 4));
+}
+
+function estimateCost(tokenUsage: TokenUsage, pricing: TokenPricing | undefined): RunCost {
+  if (!pricing) {
+    return {
+      estimatedUsd: 0,
+      source: "not_configured",
+    };
+  }
+
+  return {
+    estimatedUsd: roundUsd(
+      (tokenUsage.promptTokens / 1_000_000) * pricing.promptUsdPer1MTokens +
+      (tokenUsage.completionTokens / 1_000_000) * pricing.completionUsdPer1MTokens,
+    ),
+    source: "estimated",
+  };
+}
+
+function roundUsd(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 function toolError(

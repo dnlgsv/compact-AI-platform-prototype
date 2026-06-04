@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { formatRunResult, parseCliArgs } from "../src/cli-format.ts";
 import type { AgentRunResult } from "../src/index.ts";
+import { testRunMetadata } from "./fixtures.ts";
 
 test("parseCliArgs extracts --json and task text", () => {
   assert.deepEqual(parseCliArgs(["--json", "How", "old?"]), {
@@ -75,6 +76,15 @@ test("formatRunResult includes last tool error for failed runs", () => {
       },
     ],
     trace: [],
+    metadata: testRunMetadata({
+      modelLatencyMs: 0,
+      tokens: {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        source: "estimated",
+      },
+    }),
     stopReason: "step_limit",
   }, { json: false });
 
@@ -94,5 +104,6 @@ const completedRun: AgentRunResult = {
   ],
   observations: [],
   trace: [],
+  metadata: testRunMetadata(),
   stopReason: "final_answer",
 };

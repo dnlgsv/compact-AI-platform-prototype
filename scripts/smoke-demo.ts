@@ -98,6 +98,26 @@ const result: AgentRunResult = {
       },
     },
   ],
+  metadata: {
+    startedAt: "2026-06-04T00:00:00.000Z",
+    endedAt: "2026-06-04T00:00:00.003Z",
+    totalLatencyMs: 3,
+    modelLatencyMs: 1,
+    toolLatencyMs: 1,
+    modelName: "offline-demo",
+    promptVersion: "research-v1",
+    workflowVersion: "research:v1",
+    tokens: {
+      promptTokens: 120,
+      completionTokens: 24,
+      totalTokens: 144,
+      source: "estimated",
+    },
+    cost: {
+      estimatedUsd: 0,
+      source: "not_configured",
+    },
+  },
   stopReason: "final_answer",
 };
 

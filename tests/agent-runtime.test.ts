@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAgent, defineTool, type ModelAction } from "../src/index.ts";
+import { createInMemoryTraceSink } from "../src/observability.ts";
 
 const echoTool = defineTool({
   name: "echo",
@@ -43,6 +44,46 @@ test("returns a final answer without tool calls", async () => {
     stopReason: "final_answer",
   });
   assert.equal(result.observations.length, 0);
+});
+
+test("records run metadata and observability sink output", async () => {
+  const traceSink = createInMemoryTraceSink();
+  const agent = createAgent({
+    tools: [echoTool],
+    traceSink,
+    metadata: {
+      modelName: "test-model",
+      promptVersion: "prompt-v2",
+      workflowVersion: "workflow-v3",
+      tokenPricing: {
+        promptUsdPer1MTokens: 1,
+        completionUsdPer1MTokens: 2,
+      },
+    },
+    model: {
+      complete() {
+        return {
+          type: "final",
+          answer: "done",
+        };
+      },
+    },
+  });
+
+  const result = await agent.run("Say done", { runId: "run_metadata" });
+
+  assert.equal(result.runId, "run_metadata");
+  assert.equal(result.metadata.modelName, "test-model");
+  assert.equal(result.metadata.promptVersion, "prompt-v2");
+  assert.equal(result.metadata.workflowVersion, "workflow-v3");
+  assert.ok(result.metadata.totalLatencyMs >= result.metadata.modelLatencyMs);
+  assert.ok(result.metadata.tokens.promptTokens > 0);
+  assert.ok(result.metadata.tokens.completionTokens > 0);
+  assert.equal(result.metadata.tokens.totalTokens, result.metadata.tokens.promptTokens + result.metadata.tokens.completionTokens);
+  assert.equal(result.metadata.cost.source, "estimated");
+  assert.ok(traceSink.spans.some((span) => span.name === "model.complete"));
+  assert.ok(traceSink.metrics.some((metric) => metric.name === "runtime.run.latency_ms"));
+  assert.ok(traceSink.metrics.some((metric) => metric.name === "runtime.tokens.total"));
 });
 
 test("executes one validated tool call per step and records an observation", async () => {
@@ -142,7 +183,7 @@ test("denies side effects not allowed by policy", async () => {
     validateInput(input: unknown) {
       return input;
     },
-    execute() {
+    execute(): unknown {
       throw new Error("Should not execute.");
     },
   });

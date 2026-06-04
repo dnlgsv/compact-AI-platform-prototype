@@ -9,6 +9,7 @@ import {
   validateRunArtifact,
   writeRunArtifact,
 } from "../src/run-artifacts.ts";
+import { testRunMetadata } from "./fixtures.ts";
 
 test("createRunArtifact validates and preserves a completed run", () => {
   const artifact = createRunArtifact("Research task", completedRun);
@@ -125,6 +126,10 @@ const completedRun: AgentRunResult = {
       status: "ok",
     },
   ],
+  metadata: testRunMetadata({
+    startedAt: "2026-06-03T00:00:00.000Z",
+    endedAt: "2026-06-03T00:00:00.010Z",
+  }),
   stopReason: "final_answer",
 };
 
@@ -164,5 +169,11 @@ const failedRun: AgentRunResult = {
       },
     },
   ],
+  metadata: testRunMetadata({
+    startedAt: "2026-06-03T00:00:00.000Z",
+    endedAt: "2026-06-03T00:00:00.010Z",
+    modelLatencyMs: 0,
+    toolLatencyMs: 1,
+  }),
   stopReason: "step_limit",
 };

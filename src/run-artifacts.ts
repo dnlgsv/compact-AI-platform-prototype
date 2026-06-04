@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import type { AgentRunResult, Citation, Observation, Source, TraceSpan } from "./index.ts";
+import type { AgentRunResult, Citation, Observation, RunMetadata, Source, TraceSpan } from "./index.ts";
 
 export type RunArtifact = {
   schemaVersion: 1;
@@ -92,8 +92,63 @@ function validateRunResult(result: AgentRunResult): void {
   for (const span of result.trace) {
     validateTraceSpan(span);
   }
+  validateRunMetadata(result.metadata);
   if (typeof result.stopReason !== "string" || result.stopReason.length === 0) {
     throw new Error("Run result stopReason must be a non-empty string.");
+  }
+}
+
+function validateRunMetadata(metadata: RunMetadata): void {
+  if (!metadata || typeof metadata !== "object") {
+    throw new Error("Run result metadata must be an object.");
+  }
+  if (!isIsoDate(metadata.startedAt) || !isIsoDate(metadata.endedAt)) {
+    throw new Error("Run metadata timestamps must be ISO timestamps.");
+  }
+  for (const [name, value] of Object.entries({
+    totalLatencyMs: metadata.totalLatencyMs,
+    modelLatencyMs: metadata.modelLatencyMs,
+    toolLatencyMs: metadata.toolLatencyMs,
+  })) {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`Run metadata ${name} must be a non-negative number.`);
+    }
+  }
+  if (typeof metadata.modelName !== "string" || metadata.modelName.length === 0) {
+    throw new Error("Run metadata modelName must be a non-empty string.");
+  }
+  if (typeof metadata.promptVersion !== "string" || metadata.promptVersion.length === 0) {
+    throw new Error("Run metadata promptVersion must be a non-empty string.");
+  }
+  if (typeof metadata.workflowVersion !== "string" || metadata.workflowVersion.length === 0) {
+    throw new Error("Run metadata workflowVersion must be a non-empty string.");
+  }
+  if (!metadata.tokens || typeof metadata.tokens !== "object") {
+    throw new Error("Run metadata tokens must be an object.");
+  }
+  for (const [name, value] of Object.entries({
+    promptTokens: metadata.tokens.promptTokens,
+    completionTokens: metadata.tokens.completionTokens,
+    totalTokens: metadata.tokens.totalTokens,
+  })) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`Run metadata tokens.${name} must be a non-negative integer.`);
+    }
+  }
+  if (metadata.tokens.totalTokens !== metadata.tokens.promptTokens + metadata.tokens.completionTokens) {
+    throw new Error("Run metadata token counts do not add up.");
+  }
+  if (metadata.tokens.source !== "estimated" && metadata.tokens.source !== "reported") {
+    throw new Error("Run metadata tokens.source is invalid.");
+  }
+  if (!metadata.cost || typeof metadata.cost !== "object") {
+    throw new Error("Run metadata cost must be an object.");
+  }
+  if (!Number.isFinite(metadata.cost.estimatedUsd) || metadata.cost.estimatedUsd < 0) {
+    throw new Error("Run metadata cost.estimatedUsd must be a non-negative number.");
+  }
+  if (metadata.cost.source !== "estimated" && metadata.cost.source !== "not_configured") {
+    throw new Error("Run metadata cost.source is invalid.");
   }
 }
 

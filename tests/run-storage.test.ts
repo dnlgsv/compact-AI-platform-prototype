@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { AgentRunResult } from "../src/index.ts";
 import { createFileRunStorage } from "../src/run-storage.ts";
+import { testRunMetadata } from "./fixtures.ts";
 
 test("file run storage saves and reads run artifacts by run id", async () => {
   const storage = createFileRunStorage("runs/test-storage-save-read");
@@ -52,6 +53,7 @@ const completedRun: AgentRunResult = {
   citations: [],
   observations: [],
   trace: [],
+  metadata: testRunMetadata(),
   stopReason: "final_answer",
 };
 
@@ -61,5 +63,14 @@ const failedRun: AgentRunResult = {
   citations: [],
   observations: [],
   trace: [],
+  metadata: testRunMetadata({
+    modelLatencyMs: 0,
+    tokens: {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      source: "estimated",
+    },
+  }),
   stopReason: "citation_validation_failed",
 };
