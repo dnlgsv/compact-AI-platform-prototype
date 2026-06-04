@@ -5,7 +5,10 @@ import test from "node:test";
 
 import { createApiServer, type ResearchRunner } from "../src/api.ts";
 import type { AgentRunResult } from "../src/index.ts";
+import { createInMemoryRunQueue } from "../src/run-queue.ts";
 import { createFileRunStorage } from "../src/run-storage.ts";
+import { createWorkflowRegistry } from "../src/workflows.ts";
+import { testRunMetadata } from "./fixtures.ts";
 
 test("GET /health returns ok", async () => {
   await withServer(mockRunner(completedRun), async (baseUrl) => {
@@ -43,6 +46,57 @@ test("POST /runs/research returns completed run from injected workflow", async (
     assert.equal(body.status, "completed");
     assert.equal(body.answer, "Grounded answer.");
   });
+});
+
+test("POST /runs enqueues an async workflow run for polling", async () => {
+  const storage = createFileRunStorage("runs/test-api-async-runs");
+  const workflows = createWorkflowRegistry([
+    {
+      name: "research",
+      version: "research:v1",
+      evalSuite: "research-evals",
+      async run(_task, options) {
+        return {
+          ...completedRun,
+          runId: options?.runId ?? "missing_run_id",
+        };
+      },
+    },
+  ]);
+  const queue = createInMemoryRunQueue({ workflows, storage });
+
+  await withServer(
+    mockRunner(completedRun),
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/runs`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: "Research task",
+          workflow: "research",
+        }),
+      });
+      const created = await response.json();
+
+      assert.equal(response.status, 202);
+      assert.equal(created.status, "queued");
+      assert.equal(created.workflow.name, "research");
+      assert.equal(created.workflow.version, "research:v1");
+
+      const polled = await pollAsyncRun(baseUrl, created.runId);
+      assert.equal(polled.status, "completed");
+      assert.equal(polled.result.runId, created.runId);
+      assert.equal(polled.artifact.url, `/runs/${created.runId}/artifact`);
+
+      const artifactResponse = await fetch(`${baseUrl}/runs/${created.runId}/artifact`);
+      const artifact = await artifactResponse.json();
+      assert.equal(artifactResponse.status, 200);
+      assert.equal(artifact.result.runId, created.runId);
+    },
+    { storage, workflows, queue },
+  );
 });
 
 test("POST /runs/research saves runs when storage is configured", async () => {
@@ -282,11 +336,17 @@ test("unknown routes return 404", async () => {
 async function withServer(
   runner: ResearchRunner,
   fn: (baseUrl: string) => Promise<void>,
-  options: { storage?: ReturnType<typeof createFileRunStorage> } = {},
+  options: {
+    storage?: ReturnType<typeof createFileRunStorage>;
+    workflows?: ReturnType<typeof createWorkflowRegistry>;
+    queue?: ReturnType<typeof createInMemoryRunQueue>;
+  } = {},
 ): Promise<void> {
   const server = createApiServer({
     research: runner,
     storage: options.storage,
+    workflows: options.workflows,
+    queue: options.queue,
   });
 
   try {
@@ -298,6 +358,18 @@ async function withServer(
   } finally {
     await closeServer(server);
   }
+}
+
+async function pollAsyncRun(baseUrl: string, runId: string) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await fetch(`${baseUrl}/runs/${runId}`);
+    const body = await response.json();
+    if (body.status === "completed" || body.status === "failed") {
+      return body;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Run ${runId} did not finish.`);
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -364,6 +436,7 @@ const completedRun: AgentRunResult = {
       status: "ok",
     },
   ],
+  metadata: testRunMetadata(),
   stopReason: "final_answer",
 };
 
@@ -373,5 +446,14 @@ const failedRun: AgentRunResult = {
   citations: [],
   observations: [],
   trace: [],
+  metadata: testRunMetadata({
+    modelLatencyMs: 0,
+    tokens: {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      source: "estimated",
+    },
+  }),
   stopReason: "citation_validation_failed",
 };

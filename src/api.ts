@@ -3,15 +3,22 @@ import { pathToFileURL } from "node:url";
 
 import type { AgentRunResult } from "./index.ts";
 import { loadDotEnv } from "./config.ts";
-import { createResearchWorkflowFromEnv } from "./research-app.ts";
+import { createResearchWorkflowFromEnv, createWorkflowRegistryFromEnv } from "./research-app.ts";
+import { createInMemoryRunQueue, type AsyncRunRecord, type RunQueue } from "./run-queue.ts";
 import { createFileRunStorage, type RunArtifactSummary, type RunStorage } from "./run-storage.ts";
+import type { WorkflowRegistry } from "./workflows.ts";
 import type { RunArtifact } from "./run-artifacts.ts";
 
 export type ResearchRunner = {
   run(task: string): Promise<AgentRunResult>;
 };
 
-export function createApiServer(deps: { research: ResearchRunner; storage?: RunStorage }) {
+export function createApiServer(deps: {
+  research: ResearchRunner;
+  storage?: RunStorage;
+  workflows?: WorkflowRegistry;
+  queue?: RunQueue;
+}) {
   return createServer(async (request, response) => {
     try {
       await handleRequest(request, response, deps);
@@ -29,7 +36,12 @@ export function createApiServer(deps: { research: ResearchRunner; storage?: RunS
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  deps: { research: ResearchRunner; storage?: RunStorage },
+  deps: {
+    research: ResearchRunner;
+    storage?: RunStorage;
+    workflows?: WorkflowRegistry;
+    queue?: RunQueue;
+  },
 ) {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", "http://localhost");
@@ -48,6 +60,72 @@ async function handleRequest(
     writeJson(response, 200, {
       status: "ok",
     });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/workflows") {
+    writeJson(response, 200, {
+      workflows: deps.workflows?.listWorkflows() ?? [],
+    });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/runs") {
+    if (!deps.queue) {
+      writeJson(response, 404, {
+        error: {
+          code: "not_found",
+          message: "Async run queue is not configured.",
+        },
+      });
+      return;
+    }
+
+    const body = await readJsonBody(request);
+    const candidate = body as { task?: unknown; workflow?: unknown; workflowVersion?: unknown };
+    if (typeof candidate.task !== "string" || candidate.task.trim() === "") {
+      writeJson(response, 400, {
+        error: {
+          code: "invalid_request",
+          message: "Expected body.task to be a non-empty string.",
+        },
+      });
+      return;
+    }
+    if (candidate.workflow !== undefined && typeof candidate.workflow !== "string") {
+      writeJson(response, 400, {
+        error: {
+          code: "invalid_request",
+          message: "Expected body.workflow to be a string when present.",
+        },
+      });
+      return;
+    }
+    if (candidate.workflowVersion !== undefined && typeof candidate.workflowVersion !== "string") {
+      writeJson(response, 400, {
+        error: {
+          code: "invalid_request",
+          message: "Expected body.workflowVersion to be a string when present.",
+        },
+      });
+      return;
+    }
+
+    try {
+      const record = deps.queue.enqueue({
+        workflowName: candidate.workflow ?? "research",
+        workflowVersion: candidate.workflowVersion,
+        task: candidate.task.trim(),
+      });
+      writeJson(response, 202, renderAsyncRunRecord(record));
+    } catch (error) {
+      writeJson(response, 400, {
+        error: {
+          code: "invalid_request",
+          message: errorMessage(error),
+        },
+      });
+    }
     return;
   }
 
@@ -122,8 +200,38 @@ async function handleRequest(
     return;
   }
 
+  const runArtifactMatch = url.pathname.match(/^\/runs\/([^/]+)\/artifact$/);
+  if (method === "GET" && runArtifactMatch) {
+    if (!deps.storage) {
+      writeJson(response, 404, {
+        error: {
+          code: "not_found",
+          message: "Run storage is not configured.",
+        },
+      });
+      return;
+    }
+    try {
+      writeJson(response, 200, await deps.storage.read(decodeURIComponent(runArtifactMatch[1])));
+    } catch (error) {
+      writeJson(response, 404, {
+        error: {
+          code: "not_found",
+          message: errorMessage(error),
+        },
+      });
+    }
+    return;
+  }
+
   const runMatch = url.pathname.match(/^\/runs\/([^/]+)$/);
   if (method === "GET" && runMatch) {
+    const asyncRun = deps.queue?.read(decodeURIComponent(runMatch[1]));
+    if (asyncRun) {
+      writeJson(response, 200, renderAsyncRunRecord(asyncRun));
+      return;
+    }
+
     if (!deps.storage) {
       writeJson(response, 404, {
         error: {
@@ -224,13 +332,44 @@ function errorMessage(error: unknown): string {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   loadDotEnv();
   const port = readPort(process.env.PORT);
+  const storage = createFileRunStorage();
+  const workflows = createWorkflowRegistryFromEnv();
   const server = createApiServer({
     research: createResearchWorkflowFromEnv(),
-    storage: createFileRunStorage(),
+    storage,
+    workflows,
+    queue: createInMemoryRunQueue({
+      workflows,
+      storage,
+    }),
   });
   server.listen(port, () => {
     console.log(`API listening on http://127.0.0.1:${port}`);
   });
+}
+
+function renderAsyncRunRecord(record: AsyncRunRecord) {
+  return {
+    runId: record.runId,
+    status: record.status,
+    workflow: {
+      name: record.workflowName,
+      version: record.workflowVersion,
+    },
+    task: record.task,
+    queuedAt: record.queuedAt,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+    result: record.result,
+    artifact: record.artifact
+      ? {
+          url: `/runs/${encodeURIComponent(record.runId)}/artifact`,
+          savedAt: record.artifact.savedAt,
+        }
+      : undefined,
+    error: record.error,
+    pollingUrl: `/runs/${encodeURIComponent(record.runId)}`,
+  };
 }
 
 function readPort(value: string | undefined): number {

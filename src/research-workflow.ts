@@ -1,11 +1,14 @@
 import {
   createAgent,
+  type AgentRunOptions,
   type AgentRunResult,
   type Citation,
   type ModelAdapter,
   type Observation,
   type Source,
+  type TokenPricing,
 } from "./index.ts";
+import type { TraceSink } from "./observability.ts";
 import {
   createFetchUrlTool,
   createSearchWebTool,
@@ -31,6 +34,11 @@ export type ResearchWorkflowConfig = {
   maxSources?: number;
   maxCharsPerSource?: number;
   maxSearchQueries?: number;
+  modelName?: string;
+  promptVersion?: string;
+  workflowVersion?: string;
+  tokenPricing?: TokenPricing;
+  traceSink?: TraceSink;
   synthesize: (
     input: ResearchSynthesisInput,
   ) => ResearchSynthesisResult | Promise<ResearchSynthesisResult>;
@@ -42,7 +50,7 @@ export function createResearchWorkflow(config: ResearchWorkflowConfig) {
   const maxSearchQueries = config.maxSearchQueries ?? 4;
 
   return {
-    run(task: string): Promise<AgentRunResult> {
+    run(task: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
       const agent = createAgent({
         tools: [
           createSearchWebTool(config.searchProvider),
@@ -58,9 +66,16 @@ export function createResearchWorkflow(config: ResearchWorkflowConfig) {
           maxSearchQueries,
           synthesize: config.synthesize,
         }),
+        metadata: {
+          modelName: config.modelName ?? "research-synthesizer",
+          promptVersion: config.promptVersion ?? "research-v1",
+          workflowVersion: config.workflowVersion ?? "research:v1",
+          tokenPricing: config.tokenPricing,
+        },
+        traceSink: config.traceSink,
       });
 
-      return agent.run(task);
+      return agent.run(task, options);
     },
   };
 }
@@ -157,8 +172,12 @@ export function buildSearchQueries(task: string): string[] {
 
 function readSearchResults(observations: Observation[]): SearchResult[] {
   return observations
-    .filter((observation) => observation.toolName === "searchWeb" && observation.result.ok)
-    .flatMap((observation) => Array.isArray(observation.result.data) ? observation.result.data : [])
+    .flatMap((observation) => {
+      if (observation.toolName !== "searchWeb" || !observation.result.ok) {
+        return [];
+      }
+      return Array.isArray(observation.result.data) ? observation.result.data : [];
+    })
     .map((value) => value as { title?: unknown; url?: unknown; snippet?: unknown })
     .filter((value): value is SearchResult =>
       typeof value.title === "string" && typeof value.url === "string"
